@@ -1,9 +1,7 @@
 var JsonWebTokenError = require('./lib/JsonWebTokenError');
-var NotBeforeError    = require('./lib/NotBeforeError');
-var TokenExpiredError = require('./lib/TokenExpiredError');
 var decode            = require('./decode');
+var PayloadVerifier   = require('./lib/verify/PayloadVerifier');
 var jws               = require('jws');
-var ms                = require('ms');
 var xtend             = require('xtend');
 
 module.exports = function (jwtString, secretOrPublicKey, options, callback) {
@@ -37,8 +35,6 @@ module.exports = function (jwtString, secretOrPublicKey, options, callback) {
   if (options.clockTimestamp && typeof options.clockTimestamp !== 'number') {
     return done(new JsonWebTokenError('clockTimestamp must be a number'));
   }
-
-  var clockTimestamp = options.clockTimestamp || Math.floor(Date.now() / 1000);
 
   if (!jwtString){
     return done(new JsonWebTokenError('jwt must be provided'));
@@ -114,67 +110,45 @@ module.exports = function (jwtString, secretOrPublicKey, options, callback) {
     return done(err);
   }
 
-  if (typeof payload.nbf !== 'undefined' && !options.ignoreNotBefore) {
-    if (typeof payload.nbf !== 'number') {
-      return done(new JsonWebTokenError('invalid nbf value'));
-    }
-    if (payload.nbf > clockTimestamp + (options.clockTolerance || 0)) {
-      return done(new NotBeforeError('jwt not active', new Date(payload.nbf * 1000)));
-    }
+  var context = {
+    clockTimestamp: options.clockTimestamp || Math.floor(Date.now() / 1000),
+    clockTolerance: options.clockTolerance || 0,
+    //PR-REVIEW: We need to pass this for maxAge so far, it may not make sense
+    //           to pass it once maxAge works with seconds.
+    verifyOptions: options
+  };
+
+  var payloadVerifier = new PayloadVerifier();
+  if (!options.ignoreNotBefore) {
+    payloadVerifier.use('nbf');
   }
-
-  if (typeof payload.exp !== 'undefined' && !options.ignoreExpiration) {
-    if (typeof payload.exp !== 'number') {
-      return done(new JsonWebTokenError('invalid exp value'));
-    }
-    if (clockTimestamp >= payload.exp + (options.clockTolerance || 0)) {
-      return done(new TokenExpiredError('jwt expired', new Date(payload.exp * 1000)));
-    }
+  if (!options.ignoreExpiration) {
+    payloadVerifier.use('exp');
   }
+  payloadVerifier.use({ audience: options.audience });
+  payloadVerifier.use({ issuer: options.issuer });
+  payloadVerifier.use({ subject: options.subject });
+  payloadVerifier.use({ jwtid: options.jwtid });
+  payloadVerifier.use({ maxAge: options.maxAge });
 
-  if (options.audience) {
-    var audiences = Array.isArray(options.audience)? options.audience : [options.audience];
-    var target = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+  /* PR-REVIEW:
+      The idea once we have decided the contract is to enable
+      consumers to send exactly what checks they want to perform
+      or omit it to let apply the defaults (nbf and exp).
+      One example of calling at that stage could be ie::
+        jwt.verify(token, secret, {
+          ... options for the operation (clockTolerance, clockTimespan, algorithms)
+          payloadChecks: [
+            'nbf',
+            { audience: 'https://myaud.com' },
+            { role: (payload) => payload.role === 'admin' } // Passing custom checks somehow
+          ]
+        })
+  */
 
-    var match = target.some(function(aud) { return audiences.indexOf(aud) != -1; });
-
-    if (!match)
-      return done(new JsonWebTokenError('jwt audience invalid. expected: ' + audiences.join(' or ')));
-  }
-
-  if (options.issuer) {
-    var invalid_issuer =
-        (typeof options.issuer === 'string' && payload.iss !== options.issuer) ||
-        (Array.isArray(options.issuer) && options.issuer.indexOf(payload.iss) === -1);
-
-    if (invalid_issuer) {
-      return done(new JsonWebTokenError('jwt issuer invalid. expected: ' + options.issuer));
-    }
-  }
-
-  if (options.subject) {
-    if (payload.sub !== options.subject) {
-      return done(new JsonWebTokenError('jwt subject invalid. expected: ' + options.subject));
-    }
-  }
-
-  if (options.jwtid) {
-    if (payload.jti !== options.jwtid) {
-      return done(new JsonWebTokenError('jwt jwtid invalid. expected: ' + options.jwtid));
-    }
-  }
-
-  if (options.maxAge) {
-    var maxAge = ms(options.maxAge);
-    if (typeof payload.iat !== 'number') {
-      return done(new JsonWebTokenError('iat required when maxAge is specified'));
-    }
-    // We have to compare against either options.clockTimestamp or the currentDate _with_ millis
-    // to not change behaviour (version 7.2.1). Should be resolve somehow for next major.
-    var nowOrClockTimestamp = ((options.clockTimestamp || 0) * 1000) || Date.now();
-    if (nowOrClockTimestamp - (payload.iat * 1000) > maxAge + (options.clockTolerance || 0) * 1000) {
-      return done(new TokenExpiredError('maxAge exceeded', new Date(payload.iat * 1000 + maxAge)));
-    }
+  var checkError = payloadVerifier.eval(payload, context);
+  if (checkError) {
+    return done(checkError);
   }
 
   return done(null, payload);
